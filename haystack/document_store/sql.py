@@ -1,5 +1,6 @@
 import itertools
 import logging
+import collections
 from typing import Any, Dict, Union, List, Optional, Generator
 from uuid import uuid4
 
@@ -34,7 +35,7 @@ class DocumentORM(ORMBase):
     vector_id = Column(String(100), unique=True, nullable=True)
 
     # speeds up queries for get_documents_by_vector_ids() by having a single query that returns joined metadata
-    meta = relationship("MetaORM", backref="Document", lazy="joined")
+    meta = relationship("MetaORM", back_populates="documents", lazy="joined")
 
 
 class MetaORM(ORMBase):
@@ -49,7 +50,7 @@ class MetaORM(ORMBase):
         index=True
     )
 
-    documents = relationship(DocumentORM, backref="Meta")
+    documents = relationship(DocumentORM, back_populates="meta")
 
 
 class LabelORM(ORMBase):
@@ -73,7 +74,7 @@ class SQLDocumentStore(BaseDocumentStore):
         url: str = "sqlite://",
         index: str = "document",
         label_index: str = "label",
-        update_existing_documents: bool = False,
+        duplicate_documents: str = "overwrite"
     ):
         """
         An SQL backed DocumentStore. Currently supports SQLite, PostgreSQL and MySQL backends.
@@ -82,19 +83,26 @@ class SQLDocumentStore(BaseDocumentStore):
         :param index: The documents are scoped to an index attribute that can be used when writing, querying, or deleting documents. 
                       This parameter sets the default value for document index.
         :param label_index: The default value of index attribute for the labels.
-        :param update_existing_documents: Whether to update any existing documents with the same ID when adding
-                                          documents. When set as True, any document with an existing ID gets updated.
-                                          If set to False, an error is raised if the document ID of the document being
-                                          added already exists. Using this parameter could cause performance degradation
-                                          for document insertion.
+        :param duplicate_documents: Handle duplicates document based on parameter options.
+                                    Parameter options : ( 'skip','overwrite','fail')
+                                    skip: Ignore the duplicates documents
+                                    overwrite: Update any existing documents with the same ID when adding documents.
+                                    fail: an error is raised if the document ID of the document being added already
+                                    exists.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+                url=url, index=index, label_index=label_index, duplicate_documents=duplicate_documents
+        )
+
         engine = create_engine(url)
         ORMBase.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
         self.session = Session()
         self.index: str = index
         self.label_index = label_index
-        self.update_existing_documents = update_existing_documents
+        self.duplicate_documents = duplicate_documents
         if getattr(self, "similarity", None) is None:
             self.similarity = None
         self.use_windowed_query = True
@@ -260,9 +268,8 @@ class SQLDocumentStore(BaseDocumentStore):
 
         return labels
 
-    def write_documents(
-        self, documents: Union[List[dict], List[Document]], index: Optional[str] = None, batch_size: int = 10_000
-    ):
+    def write_documents(self, documents: Union[List[dict], List[Document]], index: Optional[str] = None,
+                        batch_size: int = 10_000, duplicate_documents: Optional[str] = None):
         """
         Indexes documents for later queries.
 
@@ -274,11 +281,18 @@ class SQLDocumentStore(BaseDocumentStore):
         :param index: add an optional index attribute to documents. It can be later used for filtering. For instance,
                       documents for evaluation can be indexed in a separate index than the documents for search.
         :param batch_size: When working with large number of documents, batching can help reduce memory footprint.
+        :param duplicate_documents: Handle duplicates document based on parameter options.
+                                    Parameter options : ( 'skip','overwrite','fail')
+                                    skip: Ignore the duplicates documents
+                                    overwrite: Update any existing documents with the same ID when adding documents.
+                                    fail: an error is raised if the document ID of the document being added already
+                                    exists.
 
         :return: None
         """
 
         index = index or self.index
+        duplicate_documents = duplicate_documents or self.duplicate_documents
         if len(documents) == 0:
             return
         # Make sure we comply to Document class format
@@ -287,13 +301,14 @@ class SQLDocumentStore(BaseDocumentStore):
         else:
             document_objects = documents
 
+        document_objects = self._handle_duplicate_documents(document_objects, duplicate_documents)
         for i in range(0, len(document_objects), batch_size):
             for doc in document_objects[i: i + batch_size]:
                 meta_fields = doc.meta or {}
                 vector_id = meta_fields.pop("vector_id", None)
                 meta_orms = [MetaORM(name=key, value=value) for key, value in meta_fields.items()]
                 doc_orm = DocumentORM(id=doc.id, text=doc.text, vector_id=vector_id, meta=meta_orms, index=index)
-                if self.update_existing_documents:
+                if duplicate_documents == "overwrite":
                     # First old meta data cleaning is required
                     self.session.query(MetaORM).filter_by(document_id=doc.id).delete()
                     self.session.merge(doc_orm)
@@ -312,9 +327,17 @@ class SQLDocumentStore(BaseDocumentStore):
 
         labels = [Label.from_dict(l) if isinstance(l, dict) else l for l in labels]
         index = index or self.label_index
+
+        duplicate_ids: list = [label.id for label in self._get_duplicate_labels(labels, index=index)]
+        if len(duplicate_ids) > 0:
+            logger.warning(f"Duplicate Label IDs: Inserting a Label whose id already exists in this document store."
+                           f" This will overwrite the old Label. Please make sure Label.id is a unique identifier of"
+                           f" the answer annotation and not the question."
+                           f" Problematic ids: {','.join(duplicate_ids)}")
         # TODO: Use batch_size
         for label in labels:
             label_orm = LabelORM(
+                id=label.id,
                 document_id=label.document_id,
                 no_answer=label.no_answer,
                 origin=label.origin,
@@ -326,7 +349,10 @@ class SQLDocumentStore(BaseDocumentStore):
                 model_id=label.model_id,
                 index=index,
             )
-            self.session.add(label_orm)
+            if label.id in duplicate_ids:
+                self.session.merge(label_orm)
+            else:
+                self.session.add(label_orm)
         self.session.commit()
 
     def update_vector_ids(self, vector_id_map: Dict[str, str], index: Optional[str] = None, batch_size: int = 10_000):
@@ -392,7 +418,7 @@ class SQLDocumentStore(BaseDocumentStore):
         """
         Return the number of labels in the document store
         """
-        index = index or self.index
+        index = index or self.label_index
         return self.session.query(LabelORM).filter_by(index=index).count()
 
     def _convert_sql_row_to_document(self, row) -> Document:
@@ -417,7 +443,8 @@ class SQLDocumentStore(BaseDocumentStore):
             offset_start_in_doc=row.offset_start_in_doc,
             model_id=row.model_id,
             created_at=row.created_at,
-            updated_at=row.updated_at
+            updated_at=row.updated_at,
+            id=row.id
         )
         return label
 
@@ -440,19 +467,38 @@ class SQLDocumentStore(BaseDocumentStore):
         :param filters: Optional filters to narrow down the documents to be deleted.
         :return: None
         """
+        logger.warning(
+                """DEPRECATION WARNINGS: 
+                1. delete_all_documents() method is deprecated, please use delete_documents method
+                For more details, please refer to the issue: https://github.com/deepset-ai/haystack/issues/1045
+                """
+        )
+        self.delete_documents(index, filters)
 
+    def delete_documents(self, index: Optional[str] = None, filters: Optional[Dict[str, List[str]]] = None):
+        """
+        Delete documents in an index. All documents are deleted if no filters are passed.
+
+        :param index: Index name to delete the document from.
+        :param filters: Optional filters to narrow down the documents to be deleted.
+        :return: None
+        """
         index = index or self.index
-        document_ids_to_delete = self.session.query(DocumentORM.id).filter_by(index=index)
+
         if filters:
             # documents_query = documents_query.join(MetaORM)
+            document_ids_to_delete = self.session.query(DocumentORM.id).filter_by(index=index)
             for key, values in filters.items():
                 document_ids_to_delete = document_ids_to_delete.filter(
-                    MetaORM.name == key,
-                    MetaORM.value.in_(values),
-                    DocumentORM.id == MetaORM.document_id
+                        MetaORM.name == key,
+                        MetaORM.value.in_(values),
+                        DocumentORM.id == MetaORM.document_id
                 )
+            self.session.query(DocumentORM).filter(DocumentORM.id.in_(document_ids_to_delete)).delete(
+                    synchronize_session=False)
+        else:
+            self.session.query(DocumentORM).filter_by(index=index).delete(synchronize_session=False)
 
-        self.session.query(DocumentORM).filter(DocumentORM.id.in_(document_ids_to_delete)).delete(synchronize_session=False)
         self.session.commit()
 
     def _get_or_create(self, session, model, **kwargs):

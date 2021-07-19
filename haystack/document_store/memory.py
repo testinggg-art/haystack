@@ -10,7 +10,7 @@ from scipy.spatial.distance import cosine
 from tqdm import tqdm
 
 from haystack import Document, Label
-from haystack.document_store.base import BaseDocumentStore
+from haystack.document_store.base import BaseDocumentStore, DuplicateDocumentError
 from haystack.retriever.base import BaseRetriever
 from haystack.utils import get_batches_from_generator
 
@@ -31,6 +31,7 @@ class InMemoryDocumentStore(BaseDocumentStore):
         return_embedding: bool = False,
         similarity: str = "dot_product",
         progress_bar: bool = True,
+        duplicate_documents: str = 'overwrite',
     ):
         """
         :param index: The documents are scoped to an index attribute that can be used when writing, querying,
@@ -43,7 +44,21 @@ class InMemoryDocumentStore(BaseDocumentStore):
                    more performant with DPR embeddings. 'cosine' is recommended if you are using a Sentence BERT model.
         :param progress_bar: Whether to show a tqdm progress bar or not.
                              Can be helpful to disable in production deployments to keep the logs clean.
+        :param duplicate_documents: Handle duplicates document based on parameter options.
+                                    Parameter options : ( 'skip','overwrite','fail')
+                                    skip: Ignore the duplicates documents
+                                    overwrite: Update any existing documents with the same ID when adding documents.
+                                    fail: an error is raised if the document ID of the document being added already
+                                    exists.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+                index=index, label_index=label_index, embedding_field=embedding_field, embedding_dim=embedding_dim,
+                return_embedding=return_embedding, similarity=similarity, progress_bar=progress_bar,
+                duplicate_documents=duplicate_documents,
+        )
+
         self.indexes: Dict[str, Dict] = defaultdict(dict)
         self.index: str = index
         self.label_index: str = label_index
@@ -52,8 +67,10 @@ class InMemoryDocumentStore(BaseDocumentStore):
         self.return_embedding = return_embedding
         self.similarity = similarity
         self.progress_bar = progress_bar
+        self.duplicate_documents = duplicate_documents
 
-    def write_documents(self, documents: Union[List[dict], List[Document]], index: Optional[str] = None):
+    def write_documents(self, documents: Union[List[dict], List[Document]], index: Optional[str] = None,  # type: ignore
+                        duplicate_documents: Optional[str] = None):
         """
         Indexes documents for later queries.
 
@@ -65,15 +82,34 @@ class InMemoryDocumentStore(BaseDocumentStore):
                           It can be used for filtering and is accessible in the responses of the Finder.
         :param index: write documents to a custom namespace. For instance, documents for evaluation can be indexed in a
                       separate index than the documents for search.
+        :param duplicate_documents: Handle duplicates document based on parameter options.
+                                    Parameter options : ( 'skip','overwrite','fail')
+                                    skip: Ignore the duplicates documents
+                                    overwrite: Update any existing documents with the same ID when adding documents.
+                                    fail: an error is raised if the document ID of the document being added already
+                                    exists.
+        :raises DuplicateDocumentError: Exception trigger on duplicate document
         :return: None
         """
         index = index or self.index
+        duplicate_documents = duplicate_documents or self.duplicate_documents
+        assert duplicate_documents in self.duplicate_documents_options, \
+            f"duplicate_documents parameter must be {', '.join(self.duplicate_documents_options)}"
 
         field_map = self._create_document_field_map()
         documents = deepcopy(documents)
-        documents_objects = [Document.from_dict(d, field_map=field_map) if isinstance(d, dict) else d for d in documents]
+        documents_objects = [Document.from_dict(d, field_map=field_map) if isinstance(d, dict) else d for d in
+                             documents]
 
         for document in documents_objects:
+            if document.id in self.indexes[index]:
+                if duplicate_documents == "fail":
+                    raise DuplicateDocumentError(f"Document with id '{document.id} already "
+                                                 f"exists in index '{index}'")
+                elif duplicate_documents == "skip":
+                    logger.warning(f"Duplicate Documents: Document with id '{document.id} already exists in index "
+                                   f"'{index}'")
+                    continue
             self.indexes[index][document.id] = document
 
     def _create_document_field_map(self):
@@ -86,14 +122,20 @@ class InMemoryDocumentStore(BaseDocumentStore):
         index = index or self.label_index
         label_objects = [Label.from_dict(l) if isinstance(l, dict) else l for l in labels]
 
+        duplicate_ids: list = [label.id for label in self._get_duplicate_labels(label_objects, index=index)]
+        if len(duplicate_ids) > 0:
+            logger.warning(f"Duplicate Label IDs: Inserting a Label whose id already exists in this document store."
+                           f" This will overwrite the old Label. Please make sure Label.id is a unique identifier of"
+                           f" the answer annotation and not the question."
+                           f" Problematic ids: {','.join(duplicate_ids)}")
+
         for label in label_objects:
-            label_id = str(uuid4())
             # create timestamps if not available yet
             if not label.created_at:
                 label.created_at = time.strftime("%Y-%m-%d %H:%M:%S")
             if not label.updated_at:
                 label.updated_at = label.created_at
-            self.indexes[index][label_id] = label
+            self.indexes[index][label.id] = label
 
     def get_document_by_id(self, id: str, index: Optional[str] = None) -> Optional[Document]:
         """Fetch a document by specifying its text id string"""
@@ -104,7 +146,7 @@ class InMemoryDocumentStore(BaseDocumentStore):
         else:
             return None
 
-    def get_documents_by_id(self, ids: List[str], index: Optional[str] = None) -> List[Document]:
+    def get_documents_by_id(self, ids: List[str], index: Optional[str] = None) -> List[Document]:  # type: ignore
         """Fetch documents by specifying a list of text id strings"""
         index = index or self.index
         documents = [self.indexes[index][id] for id in ids]
@@ -200,7 +242,8 @@ class InMemoryDocumentStore(BaseDocumentStore):
         document_count = len(result)
         logger.info(f"Updating embeddings for {document_count} docs ...")
         batched_documents = get_batches_from_generator(result, batch_size)
-        with tqdm(total=document_count, disable=not self.progress_bar) as progress_bar:
+        with tqdm(total=document_count, disable=not self.progress_bar, position=0, unit=" docs",
+                  desc="Updating Embedding") as progress_bar:
             for document_batch in batched_documents:
                 embeddings = retriever.embed_passages(document_batch)  # type: ignore
                 assert len(document_batch) == len(embeddings)
@@ -212,6 +255,8 @@ class InMemoryDocumentStore(BaseDocumentStore):
 
                 for doc, emb in zip(document_batch, embeddings):
                     self.indexes[index][doc.id].embedding = emb
+                progress_bar.set_description_str("Documents Processed")
+                progress_bar.update(batch_size)
 
     def get_document_count(self, filters: Optional[Dict[str, List[str]]] = None, index: Optional[str] = None) -> int:
         """
@@ -282,7 +327,7 @@ class InMemoryDocumentStore(BaseDocumentStore):
         result = self.get_all_documents_generator(index=index, filters=filters, return_embedding=return_embedding)
         documents = list(result)
         return documents
-      
+
     def get_all_documents_generator(
         self,
         index: Optional[str] = None,
@@ -338,7 +383,22 @@ class InMemoryDocumentStore(BaseDocumentStore):
         :param filters: Optional filters to narrow down the documents to be deleted.
         :return: None
         """
+        logger.warning(
+                """DEPRECATION WARNINGS: 
+                1. delete_all_documents() method is deprecated, please use delete_documents method
+                For more details, please refer to the issue: https://github.com/deepset-ai/haystack/issues/1045
+                """
+        )
+        self.delete_documents(index, filters)
 
+    def delete_documents(self, index: Optional[str] = None, filters: Optional[Dict[str, List[str]]] = None):
+        """
+        Delete documents in an index. All documents are deleted if no filters are passed.
+
+        :param index: Index name to delete the document from.
+        :param filters: Optional filters to narrow down the documents to be deleted.
+        :return: None
+        """
         if filters:
             raise NotImplementedError("Delete by filters is not implemented for InMemoryDocumentStore.")
         index = index or self.index

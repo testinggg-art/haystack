@@ -1,10 +1,15 @@
+import inspect
 import logging
 import os
 import traceback
 from abc import ABC
 from copy import deepcopy
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union, Any
+import pickle
+import urllib
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
 
 import networkx as nx
 import yaml
@@ -118,6 +123,7 @@ class Pipeline:
         while queue:
             node_id = list(queue.keys())[i]
             node_input = queue[node_id]
+            node_input["node_id"] = node_id
             predecessors = set(nx.ancestors(self.graph, node_id))
             if predecessors.isdisjoint(set(queue.keys())):  # only execute if predecessor nodes are executed
                 try:
@@ -180,7 +186,7 @@ class Pipeline:
         Here's a sample configuration:
 
             ```yaml
-            |   version: '0.7'
+            |   version: '0.8'
             |
             |    components:    # define all the building-blocks for Pipeline
             |    - name: MyReader       # custom-name for the component; helpful for visualization & debugging
@@ -290,6 +296,55 @@ class Pipeline:
             if key.startswith(env_prefix):
                 param_name = key.replace(env_prefix, "").lower()
                 definition["params"][param_name] = value
+
+    def save_to_yaml(self, path: Path, return_defaults: bool = False):
+        """
+        Save a YAML configuration for the Pipeline that can be used with `Pipeline.load_from_yaml()`.
+
+        :param path: path of the output YAML file.
+        :param return_defaults: whether to output parameters that have the default values.
+        """
+        nodes = self.graph.nodes
+
+        pipeline_name = self.pipeline_type.lower()
+        pipeline_type = self.pipeline_type
+        pipelines: dict = {pipeline_name: {"name": pipeline_name, "type": pipeline_type, "nodes": []}}
+
+        components = {}
+        for node in nodes:
+            if node == self.root_node_id:
+                continue
+            component_instance = self.graph.nodes.get(node)["component"]
+            component_type = component_instance.pipeline_config["type"]
+            component_params = component_instance.pipeline_config["params"]
+            components[node] = {"name": node, "type": component_type, "params": {}}
+            component_signature = inspect.signature(type(component_instance)).parameters
+            for key, value in component_params.items():
+                # A parameter for a Component could be another Component. For instance, a Retriever has
+                # the DocumentStore as a parameter.
+                # Component configs must be a dict with a "type" key. The "type" keys distinguishes between
+                # other parameters like "custom_mapping" that are dicts.
+                # This currently only checks for the case single-level nesting case, wherein, "a Component has another
+                # Component as a parameter". For deeper nesting cases, this function should be made recursive.
+                if isinstance(value, dict) and "type" in value.keys():  # the parameter is a Component
+                    components[node]["params"][key] = value["type"]
+                    sub_component_signature = inspect.signature(BaseComponent.subclasses[value["type"]]).parameters
+                    params = {
+                        k: v for k, v in value["params"].items()
+                        if sub_component_signature[k].default != v or return_defaults is True
+                    }
+                    components[value["type"]] = {"name": value["type"], "type": value["type"], "params": params}
+                else:
+                    if component_signature[key].default != value or return_defaults is True:
+                        components[node]["params"][key] = value
+
+            # create the Pipeline definition with how the Component are connected
+            pipelines[pipeline_name]["nodes"].append({"name": node, "inputs": list(self.graph.predecessors(node))})
+
+        config = {"components": list(components.values()), "pipelines": list(pipelines.values()), "version": "0.8"}
+
+        with open(path, 'w') as outfile:
+            yaml.dump(config, outfile, default_flow_style=False)
 
 
 class BaseStandardPipeline(ABC):
@@ -543,6 +598,174 @@ class RootNode:
         return kwargs, "output_1"
 
 
+class SklearnQueryClassifier(BaseComponent):
+    """
+    A node to classify an incoming query into one of two categories using a lightweight sklearn model. Depending on the result, the query flows to a different branch in your pipeline
+    and the further processing can be customized. You can define this by connecting the further pipeline to either `output_1` or `output_2` from this node.
+
+    Example:
+     ```python
+        |{
+        |pipe = Pipeline()
+        |pipe.add_node(component=SklearnQueryClassifier(), name="QueryClassifier", inputs=["Query"])
+        |pipe.add_node(component=elastic_retriever, name="ElasticRetriever", inputs=["QueryClassifier.output_2"])
+        |pipe.add_node(component=dpr_retriever, name="DPRRetriever", inputs=["QueryClassifier.output_1"])
+
+        |# Keyword queries will use the ElasticRetriever
+        |pipe.run("kubernetes aws")
+
+        |# Semantic queries (questions, statements, sentences ...) will leverage the DPR retriever
+        |pipe.run("How to manage kubernetes on aws")
+
+     ```
+
+    Models:
+
+    Pass your own `Sklearn` binary classification model or use one of the following pretrained ones:
+    1) Keywords vs. Questions/Statements (Default)
+       query_classifier can be found [here](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier/model.pickle)
+       query_vectorizer can be found [here](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier/vectorizer.pickle)
+       output_1 => question/statement
+       output_2 => keyword query
+       [Readme](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier/readme.txt)
+
+
+    2) Questions vs. Statements
+       query_classifier can be found [here](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier_statements/model.pickle)
+       query_vectorizer can be found [here](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier_statements/vectorizer.pickle)
+       output_1 => question
+       output_2 => statement
+       [Readme](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier_statements/readme.txt)
+
+    See also the [tutorial](https://haystack.deepset.ai/docs/latest/tutorial11md) on pipelines.
+
+    """
+
+    outgoing_edges = 2
+
+    def __init__(
+        self,
+        model_name_or_path: Union[
+            str, Any
+        ] = "https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier/model.pickle",
+        vectorizer_name_or_path: Union[
+            str, Any
+        ] = "https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier/vectorizer.pickle"
+    ):
+        """
+        :param model_name_or_path: Gradient boosting based binary classifier to classify between keyword vs statement/question
+        queries or statement vs question queries.
+        :param vectorizer_name_or_path: A ngram based Tfidf vectorizer for extracting features from query.
+        """
+        if (
+            (not isinstance(model_name_or_path, Path))
+            and (not isinstance(model_name_or_path, str))
+        ) or (
+            (not isinstance(vectorizer_name_or_path, Path))
+            and (not isinstance(vectorizer_name_or_path, str))
+        ):
+            raise TypeError(
+                "model_name_or_path and vectorizer_name_or_path must either be of type Path or str"
+            )
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(model_name_or_path=model_name_or_path, vectorizer_name_or_path=vectorizer_name_or_path)
+
+        if isinstance(model_name_or_path, Path):
+            file_url = urllib.request.pathname2url(r"{}".format(model_name_or_path))
+            model_name_or_path = f"file:{file_url}"
+
+        if isinstance(vectorizer_name_or_path, Path):
+            file_url = urllib.request.pathname2url(r"{}".format(vectorizer_name_or_path))
+            vectorizer_name_or_path = f"file:{file_url}"
+
+        self.model = pickle.load(urllib.request.urlopen(model_name_or_path))
+        self.vectorizer = pickle.load(urllib.request.urlopen(vectorizer_name_or_path))
+
+
+    def run(self, **kwargs):
+        query_vector = self.vectorizer.transform([kwargs["query"]])
+
+        is_question: bool = self.model.predict(query_vector)[0]
+        if is_question:
+            return (kwargs, "output_1")
+        else:
+            return (kwargs, "output_2")
+
+
+class TransformersQueryClassifier(BaseComponent):
+    """
+    A node to classify an incoming query into one of two categories using a (small) BERT transformer model. Depending on the result, the query flows to a different branch in your pipeline
+    and the further processing can be customized. You can define this by connecting the further pipeline to either `output_1` or `output_2` from this node.
+
+    Example:
+     ```python
+        |{
+        |pipe = Pipeline()
+        |pipe.add_node(component=TransformersQueryClassifier(), name="QueryClassifier", inputs=["Query"])
+        |pipe.add_node(component=elastic_retriever, name="ElasticRetriever", inputs=["QueryClassifier.output_2"])
+        |pipe.add_node(component=dpr_retriever, name="DPRRetriever", inputs=["QueryClassifier.output_1"])
+
+        |# Keyword queries will use the ElasticRetriever
+        |pipe.run("kubernetes aws")
+
+        |# Semantic queries (questions, statements, sentences ...) will leverage the DPR retriever
+        |pipe.run("How to manage kubernetes on aws")
+
+     ```
+
+    Models:
+
+    Pass your own `Transformer` binary classification model from file/huggingface or use one of the following pretrained ones hosted on Huggingface:
+    1) Keywords vs. Questions/Statements (Default)
+       model_name_or_path="shahrukhx01/bert-mini-finetune-question-detection"
+       output_1 => question/statement
+       output_2 => keyword query
+       [Readme](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier/readme.txt)
+
+
+    2) Questions vs. Statements
+    `model_name_or_path`="shahrukhx01/question-vs-statement-classifier"
+     output_1 => question
+     output_2 => statement
+     [Readme](https://ext-models-haystack.s3.eu-central-1.amazonaws.com/gradboost_query_classifier_statements/readme.txt)
+
+     See also the [tutorial](https://haystack.deepset.ai/docs/latest/tutorial11md) on pipelines.
+    """
+
+    outgoing_edges = 2
+
+    def __init__(
+        self,
+        model_name_or_path: Union[
+            Path, str
+        ] = "shahrukhx01/bert-mini-finetune-question-detection"
+    ):
+        """
+        :param model_name_or_path: Transformer based fine tuned mini bert model for query classification
+        """
+        # save init parameters to enable export of component config as YAML
+        self.set_config(model_name_or_path=model_name_or_path)
+
+        model = AutoModelForSequenceClassification.from_pretrained(model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+        self.query_classification_pipeline = TextClassificationPipeline(
+            model=model, tokenizer=tokenizer
+        )
+
+    def run(self, **kwargs):
+
+        is_question: bool = (
+            self.query_classification_pipeline(kwargs["query"])[0]["label"] == "LABEL_1"
+        )
+
+        if is_question:
+            return (kwargs, "output_1")
+        else:
+            return (kwargs, "output_2")
+
+
 class JoinDocuments(BaseComponent):
     """
     A node to join documents outputted by multiple retriever nodes.
@@ -571,9 +794,13 @@ class JoinDocuments(BaseComponent):
         assert not (
             weights is not None and join_mode == "concatenate"
         ), "Weights are not compatible with 'concatenate' join_mode."
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(join_mode=join_mode, weights=weights, top_k_join=top_k_join)
+
         self.join_mode = join_mode
         self.weights = weights
-        self.top_k = top_k_join
+        self.top_k_join = top_k_join
 
     def run(self, **kwargs):
         inputs = kwargs["inputs"]
@@ -600,7 +827,8 @@ class JoinDocuments(BaseComponent):
             raise Exception(f"Invalid join_mode: {self.join_mode}")
 
         documents = sorted(document_map.values(), key=lambda d: d.score, reverse=True)
-        if self.top_k:
-            documents = documents[: self.top_k]
+
+        if self.top_k_join:
+            documents = documents[: self.top_k_join]
         output = {"query": inputs[0]["query"], "documents": documents, "labels": inputs[0].get("labels", None)}
         return output, "output_1"
